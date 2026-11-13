@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { searchSimilarMemories } from "../services/ragService.js";
+import { searchSimilarMemories, askMemory } from "../services/ragService.js";
 
 const router = Router();
 
@@ -48,6 +48,69 @@ router.post("/search", async (req, res) => {
     }
 
     res.status(500).json({ error: "Failed to perform semantic search", details: error.message });
+  }
+});
+
+/**
+ * POST /api/ask
+ * RAG question answering strictly grounded in personal learning memories.
+ *
+ * Request Body:
+ * {
+ *   "query": "string (required)",
+ *   "limit": 5 (optional, default 5),
+ *   "minScore": 0.55 (optional, default 0.55)
+ * }
+ */
+router.post("/ask", async (req, res) => {
+  const requestStart = performance.now();
+
+  try {
+    const { query, limit, minScore } = req.body;
+
+    if (!query || typeof query !== "string" || !query.trim()) {
+      return res.status(400).json({ error: "Query is required and must not be empty" });
+    }
+
+    const cleanQuery = query.trim();
+    const searchLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 10) : 5;
+    const threshold = typeof minScore === "number" && minScore >= 0 && minScore <= 1 ? minScore : 0.55;
+
+    const result = await askMemory(cleanQuery, {
+      limit: searchLimit,
+      minScore: threshold,
+    });
+
+    const totalLatency = `${(performance.now() - requestStart).toFixed(0)} ms`;
+    const timings = {
+      ...result.timings,
+      "Total Pipeline": totalLatency,
+    };
+
+    console.log("\n⏱️ ===== RAG Ask Latency Breakdown =====");
+    console.table(timings);
+    console.log("========================================\n");
+
+    res.json({
+      query: cleanQuery,
+      answer: result.answer,
+      hasRelevantMemories: result.hasRelevantMemories,
+      sourceCount: result.sources.length,
+      sources: result.sources,
+      timings,
+    });
+  } catch (error) {
+    console.error("RAG Ask error:", error);
+
+    if (error.message && error.message.includes("Remote search index")) {
+      return res.status(500).json({
+        error: "Atlas Vector Search Index not found.",
+        hint: "Please ensure the 'embeddings' vector index exists on 'learningmemories' in MongoDB Atlas.",
+        details: error.message,
+      });
+    }
+
+    res.status(500).json({ error: "Failed to answer question from memories", details: error.message });
   }
 });
 
