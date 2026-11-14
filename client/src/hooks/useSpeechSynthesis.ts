@@ -26,10 +26,14 @@ export function useSpeechSynthesis(): UseSpeechSynthesisReturn {
       // Cancel any ongoing speech first
       window.speechSynthesis.cancel();
 
-      // Strip markdown asterisks, hashes, and code fences so speech reads naturally
+      // Remove recognized Markdown wrappers while retaining their content.
       const cleanText = text
-        .replace(/[#*_`]/g, "")
-        .replace(/\[.*?\]/g, "")
+        .replace(/^ {0,3}#{1,6}\s+/gm, "")
+        .replace(/^ {0,3}(`{3,}|~{3,})[^\n]*$/gm, "")
+        .replace(/\[([^\]\n]+)\]\([^\s)]+\)/g, "$1")
+        .replace(/(\*\*|__)(?=\S)(.+?\S|\S)\1/g, "$2")
+        .replace(/(^|\s)(\*|_)(?=\S)(.+?\S|\S)\2(?=\s|[.,!?;:]|$)/g, "$1$3")
+        .replace(/(`+)([^`]+)\1/g, "$2")
         .trim();
 
       const utterance = new SpeechSynthesisUtterance(cleanText);

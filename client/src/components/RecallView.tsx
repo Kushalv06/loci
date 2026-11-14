@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAudioStreaming } from "../hooks/useAudioStreaming";
 import { useSpeechSynthesis } from "../hooks/useSpeechSynthesis";
 import { askMemory } from "../services/api";
@@ -12,8 +12,23 @@ export function RecallView() {
   const [textInput, setTextInput] = useState("");
   const [queryError, setQueryError] = useState<string | null>(null);
 
+  const mountedRef = useRef(false);
+  const requestRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestRef.current += 1;
+    };
+  }, []);
+
   const {
     isStreaming,
+    isProcessing,
+    statusMessage,
+    errorMessage,
+    clearError,
     liveTranscript,
     startStreaming,
     stopStreaming,
@@ -22,15 +37,18 @@ export function RecallView() {
   const { isSpeaking, speak, stop: stopSpeaking } = useSpeechSynthesis();
 
   const executeQuery = async (questionText: string) => {
-    if (!questionText.trim()) return;
+    if (!mountedRef.current || !questionText.trim()) return;
+    const request = ++requestRef.current;
+    const isCurrent = () => mountedRef.current && requestRef.current === request;
 
     stopSpeaking();
     setQueryError(null);
     setIsSearching(true);
-    setActiveQuery(questionText);
 
     try {
       const response = await askMemory(questionText);
+      if (!isCurrent()) return;
+      setActiveQuery(questionText);
       setAnswer(response.answer);
       setSources(response.sources || []);
 
@@ -38,14 +56,16 @@ export function RecallView() {
         speak(response.answer);
       }
     } catch (err: any) {
+      if (!isCurrent()) return;
       console.error("Recall query error:", err);
       setQueryError(err.message || "Failed to recall from memory.");
     } finally {
-      setIsSearching(false);
+      if (isCurrent()) setIsSearching(false);
     }
   };
 
   const handleVoiceToggle = async () => {
+    if (isSearching || isProcessing) return;
     if (isSpeaking) {
       stopSpeaking();
       return;
@@ -64,7 +84,7 @@ export function RecallView() {
 
   const handleTextSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (textInput.trim() && !isSearching) {
+    if (textInput.trim() && !isSearching && !isStreaming && !isProcessing) {
       const q = textInput.trim();
       setTextInput("");
       executeQuery(q);
@@ -78,9 +98,11 @@ export function RecallView() {
         <button
           className={`btn-voice-recall ${isStreaming ? "listening" : ""} ${isSpeaking ? "speaking" : ""}`}
           onClick={handleVoiceToggle}
-          disabled={isSearching}
+          disabled={isSearching || isProcessing}
         >
-          {isStreaming ? (
+          {isProcessing ? (
+            <span>{statusMessage || "Initializing voice..."}</span>
+          ) : isStreaming ? (
             <>
               <span className="pulse-dot" />
               <span>Listening... Tap to Ask</span>
@@ -105,10 +127,13 @@ export function RecallView() {
         )}
       </div>
 
-      {queryError && (
+      {(queryError || errorMessage) && (
         <div className="error-banner">
-          <span>{queryError}</span>
-          <button className="btn-close" onClick={() => setQueryError(null)}>
+          <span>{[queryError, errorMessage].filter(Boolean).join(" ")}</span>
+          <button className="btn-close" onClick={() => {
+            setQueryError(null);
+            clearError();
+          }}>
             ✕
           </button>
         </div>
@@ -149,12 +174,12 @@ export function RecallView() {
           placeholder="Or type a question to recall..."
           value={textInput}
           onChange={(e) => setTextInput(e.target.value)}
-          disabled={isSearching || isStreaming}
+          disabled={isSearching || isStreaming || isProcessing}
         />
         <button
           type="submit"
           className="btn-text-submit"
-          disabled={!textInput.trim() || isSearching || isStreaming}
+          disabled={!textInput.trim() || isSearching || isStreaming || isProcessing}
         >
           Ask
         </button>
