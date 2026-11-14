@@ -14,6 +14,19 @@ export interface UseAudioStreamingReturn {
   clearError: () => void;
 }
 
+// Resolve on acknowledgement, cancellation, or a bounded timeout.
+function completionSignal(timeoutMs: number) {
+  let complete!: (success: boolean) => void;
+  const promise = new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => complete(false), timeoutMs);
+    complete = (success) => {
+      clearTimeout(timer);
+      resolve(success);
+    };
+  });
+  return { promise, complete };
+}
+
 export function useAudioStreaming(): UseAudioStreamingReturn {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -29,6 +42,13 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
   const streamRef = useRef<MediaStream | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const isStreamingRef = useRef<boolean>(false);
+
+  const mountedRef = useRef(false);
+  const generationRef = useRef(0);
+  const busyRef = useRef(false);
+  const stoppingRef = useRef(false);
+  const flushCompleteRef = useRef<((success: boolean) => void) | null>(null);
+  const terminationCompleteRef = useRef<((success: boolean) => void) | null>(null);
 
   // Turn Accumulation Refs
   const accumulatedTranscriptRef = useRef<string>("");
@@ -58,21 +78,28 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
       } catch {}
       workletNodeRef.current = null;
     }
-    if (audioContextRef.current) {
-      try {
-        await audioContextRef.current.close();
-      } catch {}
-      audioContextRef.current = null;
-    }
+    const audioContext = audioContextRef.current;
+    audioContextRef.current = null;
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
+    }
+    if (audioContext) {
+      try {
+        await audioContext.close();
+      } catch {}
     }
   }, []);
 
   // Cleanup on unmount
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
+      generationRef.current += 1;
+      busyRef.current = false;
+      flushCompleteRef.current?.(false);
+      terminationCompleteRef.current?.(false);
       isStreamingRef.current = false;
       teardownAudioHardware();
       if (socketRef.current) {
@@ -83,6 +110,10 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
   }, [teardownAudioHardware]);
 
   const startStreaming = useCallback(async () => {
+    if (!mountedRef.current || busyRef.current || stoppingRef.current) return;
+    busyRef.current = true;
+    const generation = ++generationRef.current;
+    const isCurrent = () => mountedRef.current && generationRef.current === generation;
     try {
       setErrorMessage(null);
       accumulatedTranscriptRef.current = "";
@@ -94,6 +125,10 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
 
       // 1. Request microphone permission
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!isCurrent()) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       streamRef.current = stream;
 
       // 2. Initialize 16kHz AudioContext
@@ -103,10 +138,12 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
 
       if (audioContext.state === "suspended") {
         await audioContext.resume();
+        if (!isCurrent()) return;
       }
 
       // 3. Register PCM processor worklet
       await audioContext.audioWorklet.addModule("/pcm-processor.js");
+      if (!isCurrent()) return;
       const workletNode = new AudioWorkletNode(audioContext, "pcm-processor", {
         numberOfInputs: 1,
         numberOfOutputs: 0,
@@ -121,6 +158,7 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
       // 5. Fetch streaming token from backend
       setStatusMessage("Connecting to AssemblyAI...");
       const token = await getStreamingToken();
+      if (!isCurrent()) return;
 
       // 6. Open direct WebSocket to AssemblyAI v3
       const wsUrl = `wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&token=${token}`;
@@ -128,11 +166,13 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
       socketRef.current = ws;
 
       ws.onopen = async () => {
+        if (!isCurrent()) return;
         if (audioContextRef.current && audioContextRef.current.state === "suspended") {
           try {
             await audioContextRef.current.resume();
           } catch {}
         }
+        if (!isCurrent()) return;
         setStatusMessage("Listening in real-time...");
         isStreamingRef.current = true;
         setIsStreaming(true);
@@ -147,6 +187,11 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
 
       // Pipe Int16 PCM chunks from worklet to WebSocket
       workletNode.port.onmessage = (event) => {
+        if (!isCurrent()) return;
+        if (event.data?.type === "FLUSH_COMPLETE") {
+          flushCompleteRef.current?.(true);
+          return;
+        }
         if (event.data?.type === "WARN_SAMPLE_RATE") {
           console.warn(`[AudioWorklet Warning] Sample rate is ${event.data.actualSampleRate}Hz (expected 16000Hz)`);
           return;
@@ -157,9 +202,12 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
       };
 
       ws.onmessage = (event) => {
+        if (!isCurrent()) return;
         try {
           const data = JSON.parse(event.data);
-          if (data.type === "Turn") {
+          if (data.type === "Termination") {
+            terminationCompleteRef.current?.(true);
+          } else if (data.type === "Turn") {
             const turnTranscript = (data.transcript || "").trim();
 
             if (data.end_of_turn) {
@@ -184,6 +232,13 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
       };
 
       ws.onerror = (event) => {
+        if (!isCurrent()) return;
+        terminationCompleteRef.current?.(false);
+        if (stoppingRef.current) return;
+        busyRef.current = false;
+        generationRef.current += 1;
+        ws.close();
+        if (socketRef.current === ws) socketRef.current = null;
         console.error("AssemblyAI WebSocket error:", event);
         setErrorMessage("AssemblyAI connection encountered an error.");
         isStreamingRef.current = false;
@@ -193,7 +248,12 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
       };
 
       ws.onclose = () => {
-        if (isStreamingRef.current) {
+        if (!isCurrent()) return;
+        terminationCompleteRef.current?.(false);
+        if (stoppingRef.current) return;
+        busyRef.current = false;
+        generationRef.current += 1;
+        if (isStreamingRef.current || socketRef.current === ws) {
           isStreamingRef.current = false;
           teardownAudioHardware();
           setIsStreaming(false);
@@ -201,6 +261,7 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
         }
       };
     } catch (err: any) {
+      if (!isCurrent()) return;
       console.error("Start streaming error:", err);
       isStreamingRef.current = false;
       await teardownAudioHardware();
@@ -208,6 +269,8 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
         socketRef.current.close();
         socketRef.current = null;
       }
+      if (!isCurrent()) return;
+      busyRef.current = false;
       setIsStreaming(false);
       setIsProcessing(false);
 
@@ -220,60 +283,72 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
   }, [teardownAudioHardware]);
 
   const stopStreaming = useCallback(async (): Promise<string | null> => {
-    if (!isStreamingRef.current && !isProcessing) return null;
+    if (!busyRef.current || stoppingRef.current) return null;
+    // A stop during startup cancels every pending continuation.
+    if (!isStreamingRef.current) {
+      generationRef.current += 1;
+      await teardownAudioHardware();
+      socketRef.current?.close();
+      socketRef.current = null;
+      busyRef.current = false;
+      if (mountedRef.current) {
+        setIsProcessing(false);
+        setStatusMessage("");
+      }
+      return null;
+    }
 
+    stoppingRef.current = true;
+    const generation = generationRef.current;
+    const isCurrent = () => mountedRef.current && generationRef.current === generation;
+    const ws = socketRef.current;
     clearTimer();
     isStreamingRef.current = false;
     setIsStreaming(false);
     setIsProcessing(true);
     setStatusMessage("Flushing audio buffer...");
 
-    // 1. Flush remaining audio from worklet
-    if (workletNodeRef.current) {
-      workletNodeRef.current.port.postMessage("flush");
-    }
-
-    // 2. Disconnect mic source
-    if (sourceNodeRef.current) {
-      try {
-        sourceNodeRef.current.disconnect();
-      } catch {}
+    let finalized = false;
+    try {
+      // Freeze capture, then wait until the tail has been forwarded to the socket.
+      sourceNodeRef.current?.disconnect();
       sourceNodeRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
-    }
+      if (!workletNodeRef.current) throw new Error("Audio worklet unavailable");
+      const flush = completionSignal(2000);
+      flushCompleteRef.current = flush.complete;
+      workletNodeRef.current.port.postMessage("flush");
+      const flushed = await flush.promise;
+      flushCompleteRef.current = null;
+      if (!flushed || !isCurrent()) throw new Error("Audio flush incomplete");
 
-    // 3. Send Terminate message to flush server-side buffers
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      try {
-        socketRef.current.send(JSON.stringify({ type: "Terminate" }));
-      } catch {}
+      if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("Socket unavailable");
+      setStatusMessage("Finalizing transcript...");
+      const termination = completionSignal(5000);
+      terminationCompleteRef.current = termination.complete;
+      ws.send(JSON.stringify({ type: "Terminate" }));
+      finalized = await termination.promise;
+    } catch (err) {
+      console.error("Stream finalization error:", err);
+    } finally {
+      flushCompleteRef.current?.(false);
+      terminationCompleteRef.current?.(false);
+      flushCompleteRef.current = null;
+      terminationCompleteRef.current = null;
+      await teardownAudioHardware();
+      ws?.close();
+      if (socketRef.current === ws) socketRef.current = null;
+      stoppingRef.current = false;
+      busyRef.current = false;
     }
-
-    // 4. Graceful buffer transit window
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    // 5. Clean up audioContext and WebSocket
-    if (workletNodeRef.current) {
-      workletNodeRef.current.port.onmessage = null;
-      try {
-        workletNodeRef.current.disconnect();
-      } catch {}
-      workletNodeRef.current = null;
-    }
-    if (audioContextRef.current) {
-      try {
-        await audioContextRef.current.close();
-      } catch {}
-      audioContextRef.current = null;
-    }
-    if (socketRef.current) {
-      if (socketRef.current.readyState === WebSocket.OPEN) {
-        socketRef.current.close();
-      }
-      socketRef.current = null;
+    if (!isCurrent()) return null;
+    generationRef.current += 1;
+    setIsProcessing(false);
+    setStatusMessage("");
+    if (!finalized) {
+      setErrorMessage("Transcript finalization incomplete. Please try recording again.");
+      return null;
     }
 
     // 6. Compute authoritative final transcript
@@ -295,7 +370,7 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
     }
 
     return finalTranscript;
-  }, [isProcessing]);
+  }, [teardownAudioHardware]);
 
   const resetTranscript = useCallback(() => {
     accumulatedTranscriptRef.current = "";

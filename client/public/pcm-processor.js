@@ -9,6 +9,7 @@ class PCMProcessor extends AudioWorkletProcessor {
     this.bufferSize = 2048;
     this.buffer = new Float32Array(this.bufferSize);
     this.bufferIndex = 0;
+    this.flushed = false;
 
     // Optional sanity check: notify main thread if sample rate does not match 16kHz
     if (sampleRate !== 16000) {
@@ -21,7 +22,9 @@ class PCMProcessor extends AudioWorkletProcessor {
     // Listen for manual flush when recording stops to prevent clipping tail audio
     this.port.onmessage = (event) => {
       if (event.data === "flush" || event.data?.action === "flush") {
+        this.flushed = true;
         this.flushRemaining();
+        this.port.postMessage({ type: "FLUSH_COMPLETE" });
       }
     };
   }
@@ -42,6 +45,7 @@ class PCMProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs) {
+    if (this.flushed) return false;
     const input = inputs[0];
     if (!input || input.length === 0) {
       return true;
