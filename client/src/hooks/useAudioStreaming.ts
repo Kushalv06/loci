@@ -14,6 +14,11 @@ export interface UseAudioStreamingReturn {
   clearError: () => void;
 }
 
+export interface AudioStreamingOptions {
+  onTurnComplete?: (transcript: string) => void;
+  onSpeechDetected?: () => void;
+}
+
 // Resolve on acknowledgement, cancellation, or a bounded timeout.
 function completionSignal(timeoutMs: number) {
   let complete!: (success: boolean) => void;
@@ -27,7 +32,10 @@ function completionSignal(timeoutMs: number) {
   return { promise, complete };
 }
 
-export function useAudioStreaming(): UseAudioStreamingReturn {
+export function useAudioStreaming(options?: AudioStreamingOptions): UseAudioStreamingReturn {
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+
   const [isStreaming, setIsStreaming] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
@@ -123,8 +131,14 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
       setStatusMessage("Initializing microphone & audio context...");
       setIsProcessing(true);
 
-      // 1. Request microphone permission
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // 1. Request microphone permission with hardware echo cancellation for hands-free interaction
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       if (!isCurrent()) {
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -215,10 +229,14 @@ export function useAudioStreaming(): UseAudioStreamingReturn {
                 accumulatedTranscriptRef.current = accumulatedTranscriptRef.current
                   ? `${accumulatedTranscriptRef.current} ${turnTranscript}`
                   : turnTranscript;
+                optionsRef.current?.onTurnComplete?.(turnTranscript);
               }
               currentTurnRef.current = "";
               setLiveTranscript(accumulatedTranscriptRef.current);
             } else {
+              if (turnTranscript) {
+                optionsRef.current?.onSpeechDetected?.();
+              }
               currentTurnRef.current = turnTranscript;
               const liveCombined = accumulatedTranscriptRef.current
                 ? `${accumulatedTranscriptRef.current} ${turnTranscript}`

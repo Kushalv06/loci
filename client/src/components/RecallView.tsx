@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useAudioStreaming } from "../hooks/useAudioStreaming";
 import { useSpeechSynthesis } from "../hooks/useSpeechSynthesis";
 import { askMemory } from "../services/api";
@@ -12,50 +12,73 @@ export function RecallView() {
   const [textInput, setTextInput] = useState("");
   const [queryError, setQueryError] = useState<string | null>(null);
 
+  const { isSpeaking, speak, stop: stopSpeaking } = useSpeechSynthesis();
+
+  const isSpeakingRef = useRef(false);
+  isSpeakingRef.current = isSpeaking;
+
+  const isSearchingRef = useRef(false);
+  isSearchingRef.current = isSearching;
+
+  const executeQuery = useCallback(
+    async (questionText: string) => {
+      const clean = questionText.trim();
+      if (!clean || isSearchingRef.current) return;
+
+      stopSpeaking();
+      setQueryError(null);
+      setIsSearching(true);
+      setActiveQuery(clean);
+
+      try {
+        const response = await askMemory(clean);
+        setAnswer(response.answer);
+        setSources(response.sources || []);
+
+        if (response.answer) {
+          speak(response.answer);
+        }
+      } catch (err: any) {
+        console.error("Recall query error:", err);
+        setQueryError(err.message || "Failed to recall from memory.");
+      } finally {
+        setIsSearching(false);
+      }
+    },
+    [speak, stopSpeaking]
+  );
+
+  // Hands-free barge-in: the instant the user speaks, interrupt Loci immediately
+  const handleSpeechDetected = useCallback(() => {
+    if (isSpeakingRef.current) {
+      stopSpeaking();
+    }
+  }, [stopSpeaking]);
+
+  // Hands-free turn completion: when user finishes speaking, auto-trigger query
+  const handleTurnComplete = useCallback(
+    (transcript: string) => {
+      if (transcript.trim() && !isSearchingRef.current) {
+        executeQuery(transcript.trim());
+      }
+    },
+    [executeQuery]
+  );
+
   const {
     isStreaming,
     liveTranscript,
     startStreaming,
     stopStreaming,
-  } = useAudioStreaming();
+  } = useAudioStreaming({
+    onSpeechDetected: handleSpeechDetected,
+    onTurnComplete: handleTurnComplete,
+  });
 
-  const { isSpeaking, speak, stop: stopSpeaking } = useSpeechSynthesis();
-
-  const executeQuery = async (questionText: string) => {
-    if (!questionText.trim()) return;
-
-    stopSpeaking();
-    setQueryError(null);
-    setIsSearching(true);
-    setActiveQuery(questionText);
-
-    try {
-      const response = await askMemory(questionText);
-      setAnswer(response.answer);
-      setSources(response.sources || []);
-
-      if (response.answer) {
-        speak(response.answer);
-      }
-    } catch (err: any) {
-      console.error("Recall query error:", err);
-      setQueryError(err.message || "Failed to recall from memory.");
-    } finally {
-      setIsSearching(false);
-    }
-  };
-
-  const handleVoiceToggle = async () => {
-    if (isSpeaking) {
-      stopSpeaking();
-      return;
-    }
-
+  const handleLiveToggle = async () => {
     if (isStreaming) {
-      const finalSpokenText = await stopStreaming();
-      if (finalSpokenText) {
-        await executeQuery(finalSpokenText);
-      }
+      stopSpeaking();
+      await stopStreaming();
     } else {
       stopSpeaking();
       await startStreaming();
@@ -71,37 +94,59 @@ export function RecallView() {
     }
   };
 
+  // Teardown speech when component unmounts
+  useEffect(() => {
+    return () => {
+      stopSpeaking();
+    };
+  }, [stopSpeaking]);
+
   return (
     <div className="recall-container">
-      {/* Voice Action Button */}
+      {/* Live Voice Section */}
       <div className="recall-voice-section">
         <button
           className={`btn-voice-recall ${isStreaming ? "listening" : ""} ${isSpeaking ? "speaking" : ""}`}
-          onClick={handleVoiceToggle}
-          disabled={isSearching}
+          onClick={handleLiveToggle}
         >
           {isStreaming ? (
-            <>
-              <span className="pulse-dot" />
-              <span>Listening... Tap to Ask</span>
-            </>
-          ) : isSpeaking ? (
-            <>
-              <span className="speaker-icon">🔊</span>
-              <span>Speaking... Tap to Stop</span>
-            </>
-          ) : isSearching ? (
-            <span>Searching memory palace...</span>
+            isSpeaking ? (
+              <>
+                <span className="speaker-icon">🔊</span>
+                <span>Speaking... (Speak to Interrupt)</span>
+              </>
+            ) : isSearching ? (
+              <>
+                <span className="pulse-dot" />
+                <span>Searching memories...</span>
+              </>
+            ) : (
+              <>
+                <span className="pulse-dot" />
+                <span>Listening... (Speak anytime)</span>
+              </>
+            )
           ) : (
             <>
               <span className="mic-icon">🎙️</span>
-              <span>Ask with Voice</span>
+              <span>Start Live Interaction</span>
             </>
           )}
         </button>
 
-        {isStreaming && liveTranscript && (
-          <p className="recall-live-caption">"{liveTranscript}"</p>
+        {isStreaming && (
+          <div className="live-sub-bar">
+            {liveTranscript ? (
+              <p className="recall-live-caption">"{liveTranscript}"</p>
+            ) : (
+              <p className="recall-live-caption muted">
+                {isSpeaking ? "Loci is answering... speak to barge in." : "Listening for your question..."}
+              </p>
+            )}
+            <button className="btn-stop-live" onClick={handleLiveToggle}>
+              End Live Session
+            </button>
+          </div>
         )}
       </div>
 
@@ -149,12 +194,12 @@ export function RecallView() {
           placeholder="Or type a question to recall..."
           value={textInput}
           onChange={(e) => setTextInput(e.target.value)}
-          disabled={isSearching || isStreaming}
+          disabled={isSearching}
         />
         <button
           type="submit"
           className="btn-text-submit"
-          disabled={!textInput.trim() || isSearching || isStreaming}
+          disabled={!textInput.trim() || isSearching}
         >
           Ask
         </button>
@@ -162,4 +207,3 @@ export function RecallView() {
     </div>
   );
 }
-
