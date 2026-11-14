@@ -6,6 +6,7 @@ import { Header } from "./components/Header";
 import { AudioControls } from "./components/AudioControls";
 import { LiveTranscript } from "./components/LiveTranscript";
 import { NoteCard } from "./components/NoteCard";
+import { RecallView } from "./components/RecallView";
 import "./App.css";
 
 export default function App() {
@@ -100,13 +101,7 @@ export default function App() {
           {note && <NoteCard note={note} />}
         </main>
       ) : (
-        <section className="recall-placeholder">
-          <h3>Live Voice Recall Mode</h3>
-          <p>
-            Real-time conversational recall with your memory palace will land
-            here in PR #2.
-          </p>
-        </section>
+        <RecallView />
       )}
     </div>
   );
