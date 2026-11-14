@@ -83,7 +83,7 @@ export async function askMemory(queryText, options = {}) {
   // 3. Early return if no memories meet the threshold
   if (relevantMemories.length === 0) {
     return {
-      answer: "Based on your saved memories, you haven't recorded anything about this topic yet.",
+      answer: "Not recorded in your notes.",
       sources: [],
       hasRelevantMemories: false,
       timings,
